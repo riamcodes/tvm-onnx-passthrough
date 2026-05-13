@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TVM ONNX Passthrough – Full Master Document</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; line-height: 1.7; margin: 0; color: #222; background: #f7f9fc; }
+  .wrap { max-width: 980px; margin: 0 auto; background: white; padding: 40px 56px 64px; box-shadow: 0 4px 18px rgba(0,0,0,.08); }
+  h1, h2, h3 { color: #153b66; line-height: 1.25; }
+  h1 { font-size: 2.2rem; margin-top: 0; }
+  h2 { margin-top: 2.25rem; border-bottom: 2px solid #e7eef8; padding-bottom: 8px; }
+  h3 { margin-top: 1.4rem; }
+  p, li { font-size: 1rem; }
+  pre { background: #f3f6fb; border: 1px solid #dde6f3; border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  code { font-family: "Courier New", monospace; }
+  .note { background: #eef5ff; border-left: 4px solid #4d86d8; padding: 12px 14px; border-radius: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; }
+  th, td { border: 1px solid #dbe5f1; padding: 10px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f5fb; }
+  .small { color: #555; font-size: .95rem; }
+  .mono { font-family: "Courier New", monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>TVM ONNX Passthrough Project – Full Master Document</h1>
+
+<p>This document is a clean, chronological record of the project development process, written as a streamlined explanation of what was built, why it was built that way, and how each stage connects to the original assignment prompt. The goal was not just to produce code that works, but to move through the project in a logical sequence: first proving that a Python package can be installed, then proving that Python can call into C++, then reshaping that package into a small TVM-like runtime interface, and finally making that interface delegate execution to ONNX Runtime. This is the clearest way to show both technical understanding and a sensible development process.</p>
+
+<p>The work was done in a <strong>Linux environment</strong>, specifically on a server that behaves like an Ubuntu/Linux development setup for command-line work. That operating system choice matters because the assignment explicitly asks for a Python module with a C/C++ component linked into Python as a shared object file, which on Linux is typically a <code>.so</code> file. Even though the exact server was an SMU Linux machine rather than a fresh local Ubuntu install, the workflow followed the same Linux-style packaging and build process you would use on Ubuntu: terminal commands, virtual environments, CMake, pip-based installation, and native extension compilation.</p>
+
+<div class="note">
+  <strong>Where this should be done:</strong> on Ubuntu/Linux or a Linux server. The project relies on Linux-native build behavior for Python extensions, so this kind of workflow is best developed and tested in a Linux environment rather than on macOS or Windows first.
+</div>
+
+<h2>1. Assignment Goal</h2>
+
+<p>The assignment asked for a Python module that is installable via pip or Conda, starts as a simple module with one task, is then modified to include a C/C++ component, and eventually exposes a TVM-style interface implemented in C/C++ on Linux. The prompt also made it clear that the inference logic itself should not be reinvented. Instead, the implementation should be pass-through, meaning the custom module serves mainly as a wrapper or bridge while ONNX Runtime performs the real ONNX execution.</p>
+
+<p>That requirement strongly suggests an incremental build strategy. Jumping straight into a final runtime wrapper would make debugging much harder and would hide whether packaging, native compilation, Python imports, or ONNX inference were responsible for any issues. Because of that, the project was built in four layers: basic Python packaging, C++ extension integration, TVM-style interface design, and ONNX Runtime pass-through. Each layer solved one problem at a time.</p>
+
+<table>
+  <tr><th>Stage</th><th>Purpose</th></tr>
+  <tr><td>Pure Python package</td><td>Prove that the project can be packaged and installed with <code>pip install .</code></td></tr>
+  <tr><td>C++ extension</td><td>Prove that Python can import a compiled Linux shared object</td></tr>
+  <tr><td>TVM-like class</td><td>Move from a toy function to a runtime-shaped interface</td></tr>
+  <tr><td>ONNX pass-through</td><td>Delegate model execution to ONNX Runtime instead of implementing inference manually</td></tr>
+</table>
+
+<h2>2. Environment Setup on Linux</h2>
+
+<p>The project began with environment setup. Since this was done on a Linux server, the cleanest approach was to create a dedicated project folder and then isolate the Python dependencies inside a virtual environment. This keeps the package dependencies local to the project and avoids conflicts with whatever Python installation the server already provides.</p>
+
+<h3>Commands used</h3>
+<pre><code>mkdir -p ~/tvm_project
+cd ~/tvm_project
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install pybind11 scikit-build-core onnxruntime numpy
+</code></pre>
+
+<p>These commands establish the development workspace. The virtual environment is important because it provides a predictable Python package environment for building and testing. The dependencies also each had a specific role. <code>pybind11</code> was used to expose C++ code to Python, <code>scikit-build-core</code> was used as a modern build backend so that <code>pip install .</code> could drive the native build, <code>onnxruntime</code> was the execution backend required by the assignment, and <code>numpy</code> was used to feed tensors into the model during testing.</p>
+
+<h2>3. Stage One – Starting as a Simple Python Module</h2>
+
+<p>The first conceptual version of the project was deliberately simple. Before introducing compiled code, it helps to think of the package as an ordinary Python module with a very small function such as <code>add(a, b)</code>. That stage is useful because it clarifies the package layout and the idea of a user-facing API before any native extension complexity is introduced. Even though the final working project moved quickly into the compiled version, the development logic still followed this progression: begin with the simplest meaningful package shape and then replace the implementation underneath it.</p>
+
+<p>At this point, the key idea was that the package should eventually allow a clean import like <code>from tvm_onnx_passthrough import ...</code>. That means the package structure needs to be correct from the beginning. The source code was therefore organized under a <code>src/</code> layout, which is a common packaging pattern because it keeps importable package files separate from build configuration and C++ source files.</p>
+
+<h3>Project structure</h3>
+<pre><code>tvm_project/
+├── cpp/
+│   └── module.cpp
+├── src/
+│   └── tvm_onnx_passthrough/
+│       ├── __init__.py
+│       └── api.py
+├── pyproject.toml
+└── CMakeLists.txt
+</code></pre>
+
+<h2>4. Stage Two – Converting the Simple Module into a C++ Extension</h2>
+
+<p>After the package structure was clear, the next task was to replace the toy Python functionality with a compiled C++ extension. This is the stage that satisfies the assignment requirement about linking a C/C++ component into Python as a shared object. Instead of building the final runtime immediately, the project first used a very small C++ function, again something like <code>add(a, b)</code>, simply to prove that the Python package could load and execute native code.</p>
+
+<p>This is an important step academically because it demonstrates that the student understands the boundary between Python and C++. Python is being used as the user-facing layer, but the actual implementation lives in compiled native code. If that boundary works for a tiny function, it can then be expanded into a class interface. If it does not work, there is no point in building higher-level runtime logic yet.</p>
+
+<h3><code>pyproject.toml</code></h3>
+<pre><code>[build-system]
+requires = ["scikit-build-core&gt;=0.10", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tvm-onnx-passthrough"
+version = "0.1.0"
+description = "Tiny TVM-like pass-through module backed by ONNX Runtime"
+requires-python = "&gt;=3.9"
+dependencies = ["onnxruntime", "numpy"]
+
+[tool.scikit-build]
+wheel.packages = ["src/tvm_onnx_passthrough"]
+</code></pre>
+
+<p>This file defines the package as something pip can build and install. It also tells pip that building the project requires pybind11 and the scikit-build-core backend. In other words, this file is what turns the directory into an actual Python package project rather than a loose folder of scripts.</p>
+
+<h3><code>CMakeLists.txt</code></h3>
+<pre><code>cmake_minimum_required(VERSION 3.18)
+project(tvm_onnx_passthrough LANGUAGES CXX)
+
+set(PYBIND11_FINDPYTHON OFF)
+find_package(pybind11 CONFIG REQUIRED)
+
+pybind11_add_module(_native cpp/module.cpp)
+target_include_directories(_native PRIVATE /usr/local/es7/include/python3.9)
+
+install(TARGETS _native DESTINATION tvm_onnx_passthrough)
+</code></pre>
+
+<p>This file controls native compilation. The most important line is <code>pybind11_add_module(_native cpp/module.cpp)</code>, which tells CMake to compile the C++ file as a Python extension module named <code>_native</code>. The explicit include path was needed on this Linux server so that the compiler could find the Python headers correctly. That is a server-specific detail, but it is still useful to document because it shows how the build was adapted to the actual Linux environment.</p>
+
+<h3>First C++ implementation</h3>
+<pre><code>#include &lt;pybind11/pybind11.h&gt;
+
+namespace py = pybind11;
+
+int add(int a, int b) {
+    return a + b;
+}
+
+PYBIND11_MODULE(_native, m) {
+    m.doc() = "Native extension";
+    m.def("add", &amp;add, "Add two integers");
+}
+</code></pre>
+
+<p>This code is intentionally small. Its purpose is not to be the final deliverable, but to prove that Python can import and call code compiled from C++. In a staged project like this, that is a very meaningful milestone because it demonstrates that packaging, compilation, shared-object loading, and the Python-to-C++ bridge are all functioning correctly.</p>
+
+<h3>Python wrapper files</h3>
+<pre><code># src/tvm_onnx_passthrough/api.py
+from ._native import add
+</code></pre>
+
+<pre><code># src/tvm_onnx_passthrough/__init__.py
+from .api import add
+
+__all__ = ["add"]
+</code></pre>
+
+<p>The wrapper files exist so that users do not need to import the internal native module directly. Instead, they interact with the clean package-level API. That is a small design choice, but it makes the package feel intentional and organized rather than exposing build internals.</p>
+
+<h3>Build and test commands</h3>
+<pre><code>python -m pip install .
+
+python -c "from tvm_onnx_passthrough import add; print(add(2, 3))"
+</code></pre>
+
+<h3>Output</h3>
+<pre><code>5
+</code></pre>
+
+<p>That output proved that the package was pip-installable and that the C++ extension was correctly linked into Python on Linux.</p>
+
+<h2>5. Stage Three – Replacing the Toy Function with a TVM-Like Interface</h2>
+
+<p>Once the C++ extension worked, the next step was to stop thinking of the project as a toy arithmetic package and instead reshape it into something that resembles a runtime interface. The assignment refers to implementing the TVM interface in C/C++, but in practice that does not mean rebuilding the whole TVM framework. It means creating a simplified runtime-style object that behaves like a model execution interface rather than a one-off math function.</p>
+
+<p>That is why the <code>add()</code> function was replaced with a <code>TVMModule</code> class. A class is a better abstraction for runtime execution because it can store state such as the model path and later expose methods like <code>run(inputs)</code>. This is more aligned with how actual model runtimes are organized, where an object represents a loaded or loadable model and methods on that object perform work.</p>
+
+<h3>Updated C++ code for the class stage</h3>
+<pre><code>#include &lt;pybind11/pybind11.h&gt;
+#include &lt;string&gt;
+
+namespace py = pybind11;
+
+class TVMModule {
+public:
+    explicit TVMModule(const std::string&amp; model_path) : model_path_(model_path) {}
+
+    std::string model_path() const {
+        return model_path_;
+    }
+
+private:
+    std::string model_path_;
+};
+
+PYBIND11_MODULE(_native, m) {
+    m.doc() = "Native TVM-like pass-through extension";
+
+    py::class_&lt;TVMModule&gt;(m, "TVMModule")
+        .def(py::init&lt;const std::string&amp;&gt;())
+        .def("model_path", &amp;TVMModule::model_path);
+}
+</code></pre>
+
+<h3>Updated Python API files</h3>
+<pre><code># src/tvm_onnx_passthrough/api.py
+from ._native import TVMModule
+</code></pre>
+
+<pre><code># src/tvm_onnx_passthrough/__init__.py
+from .api import TVMModule
+
+__all__ = ["TVMModule"]
+</code></pre>
+
+<h3>Reinstall and test</h3>
+<pre><code>python -m pip install . --force-reinstall
+
+python -c "from tvm_onnx_passthrough import TVMModule; m = TVMModule('model.onnx'); print(m.model_path())"
+</code></pre>
+
+<h3>Output</h3>
+<pre><code>model.onnx
+</code></pre>
+
+<p>This stage demonstrated that the project had progressed from a simple compiled function to a minimal runtime-style interface. The class itself did not run inference yet, but that was intentional. Separating “interface creation” from “execution implementation” makes the development easier to explain and easier to debug.</p>
+
+<h2>6. Stage Four – Making the Implementation Pass-Through to ONNX Runtime</h2>
+
+<p>This is the stage where the project became a true solution to the assignment. The prompt explicitly says that Linux already supports ONNX execution through the <code>onnxruntime</code> module and that there is no need to reinvent that functionality. In other words, the custom C++ layer should not implement tensor kernels or parse ONNX files manually. It should act as a wrapper that forwards the work to ONNX Runtime.</p>
+
+<p>That is what “pass-through” means in this context. The custom package defines the interface, but ONNX Runtime performs the actual inference. This is both technically sensible and academically appropriate because it demonstrates that the student knows when to reuse a mature runtime rather than attempting to rewrite it from scratch.</p>
+
+<h3>Final C++ implementation</h3>
+<pre><code>#include &lt;pybind11/pybind11.h&gt;
+#include &lt;pybind11/stl.h&gt;
+#include &lt;string&gt;
+
+namespace py = pybind11;
+
+class TVMModule {
+public:
+    explicit TVMModule(const std::string&amp; model_path) : model_path_(model_path) {}
+
+    std::string model_path() const {
+        return model_path_;
+    }
+
+    py::object run(py::dict inputs) const {
+        py::module_ ort = py::module_::import("onnxruntime");
+        py::object session = ort.attr("InferenceSession")(model_path_);
+        py::list output_names;
+        return session.attr("run")(output_names, inputs);
+    }
+
+private:
+    std::string model_path_;
+};
+
+PYBIND11_MODULE(_native, m) {
+    m.doc() = "Native TVM-like pass-through extension";
+
+    py::class_&lt;TVMModule&gt;(m, "TVMModule")
+        .def(py::init&lt;const std::string&amp;&gt;())
+        .def("model_path", &amp;TVMModule::model_path)
+        .def("run", &amp;TVMModule::run);
+}
+</code></pre>
+
+<p>The most important method here is <code>run()</code>. Instead of implementing inference directly in C++, it imports the Python <code>onnxruntime</code> module, creates an <code>InferenceSession</code> using the saved model path, and then calls <code>session.run()</code> with the supplied inputs. This is a neat demonstration of a hybrid design: the outer interface is C++, but the project still leverages the existing Python runtime stack underneath.</p>
+
+<h3>Rebuild and test that the method exists</h3>
+<pre><code>python -m pip install . --force-reinstall
+
+python -c "from tvm_onnx_passthrough import TVMModule; m = TVMModule('model.onnx'); print(hasattr(m, 'run'))"
+</code></pre>
+
+<h3>Output</h3>
+<pre><code>True
+</code></pre>
+
+<p>At this point, the package structure, C++ extension, TVM-style interface, and pass-through behavior were all in place. The only remaining task was to prove that the runtime could actually execute an ONNX model successfully.</p>
+
+<h2>7. Creating a Small ONNX Model for End-to-End Testing</h2>
+
+<p>To demonstrate that the final wrapper worked, a tiny ONNX model was created for testing. The simplest useful test is one where the model performs a very easy operation that can be checked by hand. The model chosen here computes <code>y = x + 2</code>. That makes the expected output obvious and removes ambiguity from the test. If the input is <code>3.0</code>, then the correct output must be <code>5.0</code>.</p>
+
+<p>Using a tiny custom model is good practice in projects like this because it gives complete control over both the model and the expected result. It also proves that the runtime is not merely importing successfully but actually running inference and returning numerical output.</p>
+
+<h3><code>make_test_model.py</code></h3>
+<pre><code>import onnx
+from onnx import helper, TensorProto, OperatorSetIdProto
+
+x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
+y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
+
+c_tensor = helper.make_tensor(
+    name="c",
+    data_type=TensorProto.FLOAT,
+    dims=[1],
+    vals=[2.0],
+)
+
+const_node = helper.make_node(
+    "Constant",
+    inputs=[],
+    outputs=["c_out"],
+    value=c_tensor,
+)
+
+add_node = helper.make_node(
+    "Add",
+    inputs=["x", "c_out"],
+    outputs=["y"],
+)
+
+graph = helper.make_graph(
+    [const_node, add_node],
+    "AddTwoGraph",
+    [x],
+    [y],
+)
+
+opset = OperatorSetIdProto()
+opset.version = 13
+
+model = helper.make_model(
+    graph,
+    producer_name="test-model",
+    opset_imports=[opset],
+)
+
+model.ir_version = 10
+
+onnx.save(model, "test_model.onnx")
+print("Saved test_model.onnx with IR version", model.ir_version)
+</code></pre>
+
+<p>The explicit <code>ir_version = 10</code> line is there for compatibility with the ONNX Runtime version available in the environment. That ensures the model file can be loaded successfully by the installed runtime.</p>
+
+<h3>Create the test model</h3>
+<pre><code>python -m pip install onnx
+python make_test_model.py
+</code></pre>
+
+<h3>Output</h3>
+<pre><code>Saved test_model.onnx with IR version 10
+</code></pre>
+
+<h2>8. Final End-to-End Inference Test</h2>
+
+<p>The last step was to use the completed package exactly the way an end user would. This is the most important proof of correctness because it exercises the whole stack at once: Python import, pip-installed package, C++ extension, runtime interface, ONNX Runtime session creation, model execution, and output conversion back to Python.</p>
+
+<h3>Final test code</h3>
+<pre><code>python - &lt;&lt;'EOF'
+import numpy as np
+from tvm_onnx_passthrough import TVMModule
+
+m = TVMModule("test_model.onnx")
+out = m.run({"x": np.array([3.0], dtype=np.float32)})
+print(out)
+EOF
+</code></pre>
+
+<h3>Final output</h3>
+<pre><code>[array([5.], dtype=float32)]
+</code></pre>
+
+<p>This output is exactly what should happen. The model computes <code>y = x + 2</code>, and since the input tensor was <code>[3.0]</code>, the resulting output tensor is <code>[5.0]</code>. The reason the printed result appears as <code>[array([5.], dtype=float32)]</code> instead of simply <code>5.0</code> is that ONNX Runtime returns a list of output arrays, and in this case there is one output array inside that list.</p>
+
+<h2>9. Final Interpretation of the Project</h2>
+
+<p>By the end of the process, the assignment requirements were satisfied in a clear and technically meaningful way. The project is pip-installable, includes a C++ extension linked into Python as a Linux shared object, exposes a minimal TVM-like runtime interface through a <code>TVMModule</code> class, and uses a pass-through design where ONNX Runtime handles the real model execution. The test model confirmed that the wrapper works end to end.</p>
+
+<p>From an academic perspective, the project demonstrates several skills at once: Python packaging, Linux-based native builds, C++/Python interoperability, interface abstraction, and thoughtful reuse of an existing ML runtime. Just as importantly, it shows a disciplined development process. The solution was not built all at once. It was built in stages that each proved one concept before moving to the next. That structure makes the project easier to explain and stronger as a submission.</p>
+
+<table>
+  <tr><th>Requirement</th><th>How it was satisfied</th></tr>
+  <tr><td>Installable via pip</td><td><code>pyproject.toml</code> + <code>python -m pip install .</code></td></tr>
+  <tr><td>Simple single-task module</td><td>Initial <code>add(a, b)</code> implementation</td></tr>
+  <tr><td>C/C++ component linked to Python</td><td>pybind11 native extension compiled into <code>_native</code></td></tr>
+  <tr><td>TVM-like interface in C/C++</td><td><code>TVMModule</code> class with model path and <code>run()</code></td></tr>
+  <tr><td>Pass-through design</td><td><code>run()</code> delegates to <code>onnxruntime</code></td></tr>
+  <tr><td>Use ONNX Runtime</td><td><code>InferenceSession</code> created inside the wrapper</td></tr>
+  <tr><td>Working result</td><td>Output <code>[array([5.], dtype=float32)]</code> from the test model</td></tr>
+</table>
+
+<h2>10. Complete Final File Set</h2>
+
+<h3><code>pyproject.toml</code></h3>
+<pre><code>[build-system]
+requires = ["scikit-build-core&gt;=0.10", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "tvm-onnx-passthrough"
+version = "0.1.0"
+description = "Tiny TVM-like pass-through module backed by ONNX Runtime"
+requires-python = "&gt;=3.9"
+dependencies = ["onnxruntime", "numpy"]
+
+[tool.scikit-build]
+wheel.packages = ["src/tvm_onnx_passthrough"]
+</code></pre>
+
+<h3><code>CMakeLists.txt</code></h3>
+<pre><code>cmake_minimum_required(VERSION 3.18)
+project(tvm_onnx_passthrough LANGUAGES CXX)
+
+set(PYBIND11_FINDPYTHON OFF)
+find_package(pybind11 CONFIG REQUIRED)
+
+pybind11_add_module(_native cpp/module.cpp)
+target_include_directories(_native PRIVATE /usr/local/es7/include/python3.9)
+
+install(TARGETS _native DESTINATION tvm_onnx_passthrough)
+</code></pre>
+
+<h3><code>cpp/module.cpp</code></h3>
+<pre><code>#include &lt;pybind11/pybind11.h&gt;
+#include &lt;pybind11/stl.h&gt;
+#include &lt;string&gt;
+
+namespace py = pybind11;
+
+class TVMModule {
+public:
+    explicit TVMModule(const std::string&amp; model_path) : model_path_(model_path) {}
+
+    std::string model_path() const {
+        return model_path_;
+    }
+
+    py::object run(py::dict inputs) const {
+        py::module_ ort = py::module_::import("onnxruntime");
+        py::object session = ort.attr("InferenceSession")(model_path_);
+        py::list output_names;
+        return session.attr("run")(output_names, inputs);
+    }
+
+private:
+    std::string model_path_;
+};
+
+PYBIND11_MODULE(_native, m) {
+    m.doc() = "Native TVM-like pass-through extension";
+
+    py::class_&lt;TVMModule&gt;(m, "TVMModule")
+        .def(py::init&lt;const std::string&amp;&gt;())
+        .def("model_path", &amp;TVMModule::model_path)
+        .def("run", &amp;TVMModule::run);
+}
+</code></pre>
+
+<h3><code>src/tvm_onnx_passthrough/api.py</code></h3>
+<pre><code>from ._native import TVMModule
+</code></pre>
+
+<h3><code>src/tvm_onnx_passthrough/__init__.py</code></h3>
+<pre><code>from .api import TVMModule
+
+__all__ = ["TVMModule"]
+</code></pre>
+
+<h3><code>make_test_model.py</code></h3>
+<pre><code>import onnx
+from onnx import helper, TensorProto, OperatorSetIdProto
+
+x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
+y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
+
+c_tensor = helper.make_tensor(
+    name="c",
+    data_type=TensorProto.FLOAT,
+    dims=[1],
+    vals=[2.0],
+)
+
+const_node = helper.make_node(
+    "Constant",
+    inputs=[],
+    outputs=["c_out"],
+    value=c_tensor,
+)
+
+add_node = helper.make_node(
+    "Add",
+    inputs=["x", "c_out"],
+    outputs=["y"],
+)
+
+graph = helper.make_graph(
+    [const_node, add_node],
+    "AddTwoGraph",
+    [x],
+    [y],
+)
+
+opset = OperatorSetIdProto()
+opset.version = 13
+
+model = helper.make_model(
+    graph,
+    producer_name="test-model",
+    opset_imports=[opset],
+)
+
+model.ir_version = 10
+
+onnx.save(model, "test_model.onnx")
+print("Saved test_model.onnx with IR version", model.ir_version)
+</code></pre>
+
+<h2>11. Short Submission Summary</h2>
+
+<p>This project implements a pip-installable Python package on Linux with a C++ backend exposed through pybind11. Development began with a simple package concept, then extended to a compiled native module, then evolved into a TVM-like runtime interface through a <code>TVMModule</code> class. The final <code>run()</code> method uses a pass-through design, delegating ONNX execution to ONNX Runtime rather than implementing inference manually. A small ONNX test model verified the end-to-end pipeline by returning the expected result <code>[array([5.], dtype=float32)]</code> for an input representing the expression <code>y = x + 2</code>.</p>
+
+</div>
+</body>
+</html>
